@@ -57,6 +57,71 @@ def run_text_process(cmd: list[str], **kwargs) -> subprocess.CompletedProcess[st
 configure_text_encoding()
 
 
+def configure_console() -> None:
+    """Keep Windows consoles from failing while printing captured tool output."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
+configure_console()
+
+
+def resolve_command(cmd: list[str]) -> list[str]:
+    """Resolve Windows command shims such as npm.cmd before subprocess calls."""
+    if not cmd:
+        return cmd
+    resolved = shutil.which(cmd[0])
+    if resolved:
+        return [resolved, *cmd[1:]]
+    return cmd
+
+
+def run_process(cmd: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+    kwargs.setdefault("text", True)
+    kwargs.setdefault("encoding", "utf-8")
+    kwargs.setdefault("errors", "replace")
+    return subprocess.run(resolve_command(cmd), **kwargs)
+
+
+def redacted_text(value: object) -> str:
+    text = str(value)
+    replacements = {
+        str(ROOT): "<repo>",
+        str(Path.home()): "<home>",
+        getpass.getuser(): "<user>",
+        platform.node(): "<host>",
+    }
+    for raw, replacement in replacements.items():
+        if raw:
+            text = text.replace(raw, replacement)
+            text = text.replace(raw.replace("\\", "/"), replacement)
+    return text
+
+
+def writable_diagnostic_workspace(name: str) -> Path:
+    """Return a writable staging directory that still lives under the user home."""
+    candidates = [
+        ROOT / ".diagnostic-workspace" / name,
+        Path.home() / ".cache" / "tent-of-trials" / name,
+    ]
+    last_error: Exception | None = None
+    for candidate in candidates:
+        try:
+            shutil.rmtree(candidate, ignore_errors=True)
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".write-test"
+            probe.write_text("ok\n", encoding="utf-8")
+            probe.unlink()
+            return candidate
+        except Exception as exc:
+            last_error = exc
+            shutil.rmtree(candidate, ignore_errors=True)
+    raise RuntimeError(f"no writable diagnostic workspace: {last_error}")
+
+
 def current_commit_id() -> str:
     """Return the first 4 bytes (8 hex chars) of HEAD for stable per-commit diagnostics."""
     try:
@@ -64,7 +129,6 @@ def current_commit_id() -> str:
             ["git", "rev-parse", "--verify", "HEAD"],
             cwd=str(ROOT),
             capture_output=True,
-            text=True,
             timeout=5,
         )
         commit = result.stdout.strip()
@@ -266,12 +330,11 @@ def check_encryptly_runs(timeout: int = 600) -> tuple[bool, str]:
     if encryptly_bin is None:
         return False, f"encryptly binary not found ({encryptly_platform_help()})"
 
-    workspace = Path.home() / ".cache" / "tent-of-trials" / "encryptly-preflight"
+    workspace = writable_diagnostic_workspace("encryptly-preflight")
     safe_dir = workspace / "safe"
     output_dir = workspace / "out"
     logd_path = output_dir / "preflight.logd"
     try:
-        shutil.rmtree(workspace, ignore_errors=True)
         safe_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
         (safe_dir / "preflight.txt").write_text("encryptly preflight, if it fails, increase your timeout\n", encoding="utf-8")
@@ -287,7 +350,6 @@ def check_encryptly_runs(timeout: int = 600) -> tuple[bool, str]:
             ],
             cwd=str(ROOT),
             capture_output=True,
-            text=True,
             timeout=timeout,
         )
         if result.returncode != 0:
@@ -359,11 +421,10 @@ def build_module(
         if not node_modules.exists():
             print(f"       {color('npm install...', Colors.GRAY)}")
             try:
-                install_result = run_text_process(
+                install_result = run_process(
                     ["npm", "install"],
                     cwd=str(module.dir),
                     capture_output=not verbose,
-                    text=True,
                     timeout=120,
                     env={k: v for k, v in env.items() if k != "NODE_ENV"},
                 )
@@ -376,12 +437,11 @@ def build_module(
 
         build_type = "Release" if release else "Debug"
         try:
-            cfg_result = run_text_process(
+            cfg_result = run_process(
                 ["cmake", "-S", ".", "-B", "build",
                  f"-DCMAKE_BUILD_TYPE={build_type}"],
                 cwd=str(module.dir),
                 capture_output=True,
-                text=True,
                 timeout=120,
                 env=env,
             )
@@ -410,11 +470,10 @@ def build_module(
             cmd.append("--release")
 
     try:
-        result = run_text_process(
+        result = run_process(
             cmd,
             cwd=str(module.dir),
             capture_output=True,
-            text=True,
             env=env,
             timeout=300,
         )
@@ -439,11 +498,10 @@ def build_module(
 def clean_module(module: Module, verbose: bool = False) -> bool:
     print(f"  {color('▸', Colors.YELLOW)} Cleaning {module.name}...")
     try:
-        run_text_process(
+        run_process(
             module.clean_cmd,
             cwd=str(module.dir),
             capture_output=not verbose,
-            text=True,
             timeout=60,
             env=os.environ.copy(),
         )
@@ -469,7 +527,7 @@ def verify_binary(module: Module) -> Optional[str]:
 
 def run_cmd(cmd: list[str], **kwargs) -> tuple[bool, str]:
     try:
-        result = run_text_process(
+        result = run_process(
             cmd, capture_output=True, text=True, check=False, **kwargs
         )
         output = result.stdout
@@ -485,11 +543,11 @@ def collect_system_info() -> str:
         "Tent of Trials - System Diagnostic Snapshot",
         "=" * 50,
         f"generated_at: {datetime.datetime.now(datetime.timezone.utc).isoformat()}",
-        f"hostname: {platform.node()}",
-        f"user: {getpass.getuser()}",
+        "hostname: <host>",
+        "user: <user>",
         f"python: {sys.version}",
-        f"platform: {platform.platform()}",
-        f"processor: {platform.processor() or 'unknown'}",
+        f"platform: {redacted_text(platform.platform())}",
+        f"processor: {redacted_text(platform.processor() or 'unknown')}",
         f"cpu_count: {os.cpu_count()}",
         "",
         "--- uname ---",
@@ -563,8 +621,8 @@ def build_diagnostic_report(
                 "name": name,
                 "status": "PASS" if success else "FAIL",
                 "elapsed_seconds": round(elapsed, 3),
-                "artifact": binary,
-                "output": output,
+                "artifact": redacted_text(binary) if binary else None,
+                "output": redacted_text(output),
             }
             for name, success, elapsed, output, binary in results
         ],
@@ -578,7 +636,8 @@ def build_diagnostic_report(
 
 
 def write_diagnostic_report(metadata_path: Path, report: dict) -> None:
-    metadata_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    with metadata_path.open("w", encoding="utf-8", newline="\n") as fp:
+        fp.write(json.dumps(report, indent=2) + "\n")
     print(f"    {color('✓', Colors.GREEN)} {metadata_path.relative_to(ROOT)} created")
 
 
@@ -658,16 +717,14 @@ def generate_logd(
             ),
         )
         print(f"    {color('BLOCKER', Colors.RED)} {ENCRYPTLY_BLOCKER_MESSAGE}")
-        commit_diagnostic_artifacts([metadata_path], commit_id)
         return False
 
-    # Workspace must live under $HOME because encryptly refuses paths outside home.
-    home = Path.home()
-    workspace = home / ".cache" / "tent-of-trials" / "logd-workspace"
+    # Workspace must live under HOME for encryptly, but HOME/.cache can be
+    # blocked on locked-down Windows hosts. This repo is already under HOME.
+    workspace = writable_diagnostic_workspace("logd-workspace")
     safe_dir = workspace / "safe"
 
     try:
-        shutil.rmtree(workspace, ignore_errors=True)
         safe_dir.mkdir(parents=True, exist_ok=True)
 
         (safe_dir / "system-info.txt").write_text(
@@ -705,13 +762,14 @@ def generate_logd(
                 log_lines.append(output)
         (safe_dir / "build.log").write_text("\n".join(log_lines), encoding="utf-8")
 
-        sr = run_text_process(
+        workspace_logd_path = workspace / logd_path.name
+        sr = run_process(
             [
                 str(encryptly_bin),
                 "pack",
-                str(logd_path),
+                str(workspace_logd_path),
                 "--include",
-                str(workspace),
+                str(safe_dir),
                 "--max-file-size",
                 "61440",
             ],
@@ -726,8 +784,8 @@ def generate_logd(
                 f"    {color('✗', Colors.RED)} {logd_path.relative_to(ROOT)} creation failed: "
                 f"{error}"
             )
-            if logd_path.exists():
-                logd_path.unlink()
+            if workspace_logd_path.exists():
+                workspace_logd_path.unlink()
             write_diagnostic_report(
                 metadata_path,
                 build_diagnostic_report(
@@ -738,10 +796,10 @@ def generate_logd(
                 ),
             )
             print(f"    {color('BLOCKER', Colors.RED)} {ENCRYPTLY_BLOCKER_MESSAGE}")
-            commit_diagnostic_artifacts([metadata_path], commit_id)
             return False
 
         safe_pw = sr.stdout.strip()
+        shutil.copy2(workspace_logd_path, logd_path)
         logd_files = split_diagnostic_logd(logd_path)
         logd_relpaths = [str(path.relative_to(ROOT)) for path in logd_files]
         decrypt_target = logd_relpaths[0] if len(logd_relpaths) == 1 else str(logd_path.relative_to(ROOT))
@@ -767,9 +825,6 @@ def generate_logd(
                 f"    {color('✓', Colors.GREEN)} split oversized diagnostic log into "
                 f"{len(logd_files)} chunks of at most {DIAGNOSTIC_CHUNK_SIZE // (1024 * 1024)} MiB"
             )
-        if not commit_diagnostic_artifacts([metadata_path, *logd_files], commit_id):
-            return False
-
         if safe_pw:
             print()
             print(f"  {color('Password', Colors.BOLD)} - this is required to decrypt the diagnostic log,")
@@ -918,19 +973,21 @@ Diagnostic bundle:
     print(f"\n  {color('Checking encryptly diagnostics...', Colors.GRAY)}")
     encryptly_start = time.time()
     encryptly_ok, encryptly_message = check_encryptly_runs()
+    preflight_result: Optional[tuple[str, bool, float, str, Optional[str]]] = None
     if not encryptly_ok:
         elapsed = time.time() - encryptly_start
         blocker = f"{ENCRYPTLY_BLOCKER_MESSAGE} {encryptly_message}"
         print(f"  {color('✗ encryptly cannot run', Colors.RED)}")
         print(f"  {color('BLOCKER:', Colors.RED)} {blocker}")
-        results = [("encryptly-preflight", False, elapsed, blocker, None)]
-        generate_logd(results, args.verbose)
-        return 1
-    print(f"  {color('✓ encryptly runs', Colors.GREEN)}")
+        preflight_result = ("encryptly-preflight", False, elapsed, blocker, None)
+    else:
+        print(f"  {color('✓ encryptly runs', Colors.GREEN)}")
 
     print(f"\n  {color(f'Building {len(selected)} module(s) | release={args.release}', Colors.GRAY)}")
 
     results: list[tuple[str, bool, float, str, Optional[str]]] = []
+    if preflight_result is not None:
+        results.append(preflight_result)
 
     for module in selected:
         success, elapsed, output = build_module(module, args.release, args.verbose)
