@@ -36,3 +36,6 @@ Thumbs.db
 # Java build artifacts
 compliance/build/
 *.class
+
+# Build diagnostic staging workspace
+.diagnostic-workspace/

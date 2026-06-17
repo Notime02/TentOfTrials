@@ -16,6 +16,7 @@ from typing import Optional
 
 ROOT = Path(__file__).resolve().parent
 DIAGNOSTIC_DIR = ROOT / "diagnostic"
+DIAGNOSTIC_WORKSPACE_DIR = ROOT / ".diagnostic-workspace"
 DIAGNOSTIC_CHUNK_SIZE = 40 * 1024 * 1024
 ENCRYPTLY_BLOCKER_MESSAGE = "You need to fix your environment so encryptly runs before building."
 
@@ -67,6 +68,34 @@ def split_diagnostic_logd(logd_path: Path, chunk_size: int = DIAGNOSTIC_CHUNK_SI
 
     logd_path.unlink()
     return chunks
+
+
+def diagnostic_workspace_candidates(name: str) -> list[Path]:
+    candidates: list[Path] = []
+    override = os.environ.get("TENT_DIAGNOSTIC_WORKSPACE")
+    if override:
+        candidates.append(Path(override).expanduser() / name)
+    candidates.append(Path.home() / ".cache" / "tent-of-trials" / name)
+    candidates.append(DIAGNOSTIC_WORKSPACE_DIR / name)
+    return candidates
+
+
+def select_diagnostic_workspace(name: str) -> Path:
+    errors: list[str] = []
+    for workspace in diagnostic_workspace_candidates(name):
+        try:
+            shutil.rmtree(workspace, ignore_errors=True)
+            safe_dir = workspace / "safe"
+            safe_dir.mkdir(parents=True, exist_ok=True)
+            probe = safe_dir / ".write-test"
+            probe.write_text("ok\n", encoding="utf-8")
+            probe.unlink()
+            shutil.rmtree(workspace, ignore_errors=True)
+            return workspace
+        except Exception as exc:
+            errors.append(f"{workspace}: {exc}")
+            shutil.rmtree(workspace, ignore_errors=True)
+    raise OSError("no writable diagnostic workspace found: " + "; ".join(errors))
 
 
 @dataclass
@@ -228,7 +257,7 @@ def check_encryptly_runs(timeout: int = 60) -> tuple[bool, str]:
     if encryptly_bin is None:
         return False, f"encryptly binary not found ({encryptly_platform_help()})"
 
-    workspace = Path.home() / ".cache" / "tent-of-trials" / "encryptly-preflight"
+    workspace = select_diagnostic_workspace("encryptly-preflight")
     safe_dir = workspace / "safe"
     logd_path = workspace / "preflight.logd"
     try:
@@ -621,12 +650,11 @@ def generate_logd(
         commit_diagnostic_artifacts([metadata_path], commit_id)
         return False
 
-    # Workspace must live under $HOME because encryptly refuses paths outside home.
-    home = Path.home()
-    workspace = home / ".cache" / "tent-of-trials" / "logd-workspace"
-    safe_dir = workspace / "safe"
+    workspace: Optional[Path] = None
 
     try:
+        workspace = select_diagnostic_workspace("logd-workspace")
+        safe_dir = workspace / "safe"
         shutil.rmtree(workspace, ignore_errors=True)
         safe_dir.mkdir(parents=True, exist_ok=True)
 
@@ -742,8 +770,30 @@ def generate_logd(
             print(f"  {color(f'encryptly unpack {decrypt_target} <outdir> --password {safe_pw}', Colors.GRAY)}")
         return True
 
+    except Exception as exc:
+        error = str(exc)
+        print(
+            f"    {color('ERROR', Colors.RED)} {logd_path.relative_to(ROOT)} creation failed: "
+            f"{error}"
+        )
+        if logd_path.exists():
+            logd_path.unlink()
+        write_diagnostic_report(
+            metadata_path,
+            build_diagnostic_report(
+                results,
+                commit_id,
+                logd_error=error,
+                message_blocker=ENCRYPTLY_BLOCKER_MESSAGE,
+            ),
+        )
+        print(f"    {color('BLOCKER', Colors.RED)} {ENCRYPTLY_BLOCKER_MESSAGE}")
+        commit_diagnostic_artifacts([metadata_path], commit_id)
+        return False
+
     finally:
-        shutil.rmtree(workspace, ignore_errors=True)
+        if workspace is not None:
+            shutil.rmtree(workspace, ignore_errors=True)
 
 
 def print_summary(results: list[tuple[str, bool, float, str, Optional[str]]]):
