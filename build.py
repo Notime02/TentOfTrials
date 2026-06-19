@@ -77,6 +77,7 @@ def redacted_text(value: object) -> str:
     username = getpass.getuser()
     if username:
         path_values.append((str(Path("C:/Users") / username), "<home>"))
+        path_values.append((str(Path("C:/Users") / f"{username[:6].upper()}~1"), "<home>"))
     for key in ("USERPROFILE", "TEMP", "TMP"):
         raw = os.environ.get(key)
         if raw:
@@ -84,6 +85,8 @@ def redacted_text(value: object) -> str:
             if key in {"TEMP", "TMP"}:
                 temp_path = Path(raw)
                 for parent in temp_path.parents:
+                    if str(parent) in {temp_path.anchor.rstrip("\\"), temp_path.anchor, str(Path(temp_path.anchor) / "Users")}:
+                        continue
                     path_values.append((str(parent), "<home>"))
 
     for raw, replacement in path_values:
