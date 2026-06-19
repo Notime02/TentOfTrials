@@ -626,7 +626,8 @@ def build_diagnostic_report(
 
 
 def write_diagnostic_report(metadata_path: Path, report: dict) -> None:
-    metadata_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    with metadata_path.open("w", encoding="utf-8", newline="\n") as fp:
+        fp.write(json.dumps(report, indent=2) + "\n")
     print(f"    {color('✓', Colors.GREEN)} {metadata_path.relative_to(ROOT)} created")
 
 
