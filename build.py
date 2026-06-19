@@ -57,6 +57,51 @@ def run_text_process(cmd: list[str], **kwargs) -> subprocess.CompletedProcess[st
 configure_text_encoding()
 
 
+def repo_relpath(path: Path) -> str:
+    """Return a repository-relative path using GitHub-style separators."""
+    return path.relative_to(ROOT).as_posix()
+
+
+def redaction_variants(value: str) -> list[str]:
+    return [value, value.replace("\\", "/"), value.replace("\\", "\\\\")]
+
+
+def redacted_text(value: object) -> str:
+    text = str(value)
+    replacements: list[tuple[str, str]] = []
+
+    path_values = [
+        (str(ROOT), "<repo>"),
+        (str(Path.home()), "<home>"),
+    ]
+    username = getpass.getuser()
+    if username:
+        path_values.append((str(Path("C:/Users") / username), "<home>"))
+    for key in ("USERPROFILE", "TEMP", "TMP"):
+        raw = os.environ.get(key)
+        if raw:
+            path_values.append((raw, f"<{key.lower()}>"))
+            if key in {"TEMP", "TMP"}:
+                temp_path = Path(raw)
+                for parent in temp_path.parents:
+                    path_values.append((str(parent), "<home>"))
+
+    for raw, replacement in path_values:
+        for variant in redaction_variants(raw):
+            replacements.append((variant, replacement))
+
+    for raw in {username, os.environ.get("USERNAME", "")}:
+        if raw:
+            replacements.append((raw, "<user>"))
+    if platform.node():
+        replacements.append((platform.node(), "<host>"))
+
+    for raw, replacement in sorted(replacements, key=lambda item: len(item[0]), reverse=True):
+        if raw:
+            text = text.replace(raw, replacement)
+    return text
+
+
 def current_commit_id() -> str:
     """Return the first 4 bytes (8 hex chars) of HEAD for stable per-commit diagnostics."""
     try:
@@ -540,7 +585,7 @@ def build_diagnostic_report(
 
     decrypt_target = logd_relpaths[0] if logd_relpaths and len(logd_relpaths) == 1 else None
     if logd_relpaths and len(logd_relpaths) > 1:
-        decrypt_target = str((DIAGNOSTIC_DIR / f"build-{commit_id}.logd").relative_to(ROOT))
+        decrypt_target = repo_relpath(DIAGNOSTIC_DIR / f"build-{commit_id}.logd")
 
     report = {
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -563,8 +608,8 @@ def build_diagnostic_report(
                 "name": name,
                 "status": "PASS" if success else "FAIL",
                 "elapsed_seconds": round(elapsed, 3),
-                "artifact": binary,
-                "output": output,
+                "artifact": redacted_text(binary) if binary else None,
+                "output": redacted_text(output),
             }
             for name, success, elapsed, output, binary in results
         ],
@@ -589,7 +634,7 @@ def commit_diagnostic_artifacts(paths: list[Path], commit_id: str) -> bool:
         print(f"    {color('✗', Colors.RED)} No diagnostic artifacts found to commit")
         return False
 
-    relpaths = [str(path.relative_to(ROOT)) for path in existing]
+    relpaths = [repo_relpath(path) for path in existing]
     status = run_text_process(
         ["git", "status", "--porcelain", "--", *relpaths],
         cwd=str(ROOT),
@@ -743,8 +788,8 @@ def generate_logd(
 
         safe_pw = sr.stdout.strip()
         logd_files = split_diagnostic_logd(logd_path)
-        logd_relpaths = [str(path.relative_to(ROOT)) for path in logd_files]
-        decrypt_target = logd_relpaths[0] if len(logd_relpaths) == 1 else str(logd_path.relative_to(ROOT))
+        logd_relpaths = [repo_relpath(path) for path in logd_files]
+        decrypt_target = logd_relpaths[0] if len(logd_relpaths) == 1 else repo_relpath(logd_path)
         write_diagnostic_report(
             metadata_path,
             build_diagnostic_report(
